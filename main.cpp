@@ -7,12 +7,10 @@
 #include <algorithm>
 #include <vector>
 #include <thread>
+#include <mutex>
+#include <string.h>
 
 using namespace std;
-
-// Prepare gloabal map
-static map<deque<wchar_t>, uint> words;
-static map<deque<wchar_t>, uint> strings;
 
 static const vector<wchar_t> accepted = {
     'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
@@ -22,10 +20,11 @@ static const vector<wchar_t> accepted = {
 
 static const vector <wchar_t> whitespaces {' ', '\n', '\r', '\t'};
 static const double CUTOFF = 0.0001;
+static const size_t BUFFER_SIZE = 2000000;
 
 
-void countWords(const deque<wchar_t>& data, const uint characters,
-                const deque<wchar_t>::const_iterator& lastPos) {
+void countWords(const deque<wchar_t>& data, const size_t characters,
+                const deque<wchar_t>::const_iterator& lastPos, map<deque<wchar_t>, uint>& words) noexcept {
     deque<wchar_t> chars;
 
     for (deque<wchar_t>::const_iterator i = data.begin(); i != lastPos; i++) {
@@ -42,8 +41,8 @@ void countWords(const deque<wchar_t>& data, const uint characters,
         }
     }
 }
-void countCharacters(const deque<wchar_t>& data, const uint characters,
-                     const deque<wchar_t>::const_iterator& lastPos) {
+void countCharacters(const deque<wchar_t>& data, const size_t characters,
+                     const deque<wchar_t>::const_iterator& lastPos, map<deque<wchar_t>, uint>& strings) noexcept {
     deque<wchar_t> chars;
 
     for (deque<wchar_t>::const_iterator i = data.begin(); i != lastPos; i++) {
@@ -99,65 +98,145 @@ void save(wofstream& stream, const map<deque<wchar_t>, uint>& map) {
     stream.close();
 }
 
-int main() {
-    uint numberOfFiles = 0;
-    cout << "Input number of files" << endl;
-    cin >> numberOfFiles;
-
-    uint numberOfCharacters = 0;
-    cout << "Input number of characters" << endl;
-    cin >> numberOfCharacters;
+void process(string filename, size_t numberOfCharacters, map<deque<wchar_t>, uint>& words,
+             map<deque<wchar_t>, uint>& strings, mutex& wordsMutex, mutex& stringsMutex) {
+    map<deque<wchar_t>, uint> wordsLocal;
+    map<deque<wchar_t>, uint> stringsLocal;
 
     wifstream input;
-    input.imbue(std::locale("pl_PL.UTF-8"));
+    input.imbue(locale(""));
+    input.open(filename);
 
-    for (uint f = 0; f < numberOfFiles; f++) {
-        char* filename = new char[8];
-        sprintf(filename, "wiki_%02d", f);
+    if (!input.is_open()) {
+        cout << "Cannot open file: " << filename << endl;
+        throw invalid_argument("IO error");
+    }
 
-        input.open(filename);
+    deque<wchar_t> buffer;
 
-        if (!input.is_open()) {
-            cout << "Cannot open files" << endl;
-            return 1;
-        }
+    for (wchar_t c; input.get(c);) {
+        buffer.push_back(tolower(c));
 
-        deque<wchar_t> buffer;
+        if (buffer.size() > BUFFER_SIZE) {
+            deque<wchar_t>::const_iterator lastIndex = find(buffer.rbegin(), buffer.rend(),
+                    static_cast<wchar_t>(' ')).base();
 
-        for (wchar_t c; input.get(c);) {
-            buffer.push_back(tolower(c));
+            if (lastIndex != buffer.rend().base()) {
+                thread wordsThread(countWords, ref(buffer), numberOfCharacters, ref(lastIndex), ref(wordsLocal));
+                thread stringsThread(countCharacters, ref(buffer), numberOfCharacters, ref(lastIndex),
+                                     ref(stringsLocal));
 
-            if (buffer.size() > 1'000'000) {
-                deque<wchar_t>::const_iterator lastIndex = find(buffer.rbegin(), buffer.rend(),
-                        static_cast<wchar_t>(' ')).base();
-
-                if (lastIndex != buffer.rend().base()) {
-                    thread t1(countWords, ref(buffer), numberOfCharacters, ref(lastIndex));
-                    thread t2(countCharacters, ref(buffer), numberOfCharacters, ref(lastIndex));
-
-                    t1.join();
-                    t2.join();
-                    buffer.erase(buffer.begin(), lastIndex);
-                }
-
+                wordsThread.join();
+                stringsThread.join();
+                buffer.erase(buffer.begin(), lastIndex);
             }
+
         }
     }
 
+    // Parsig rest of buffer
+    deque<wchar_t>::const_iterator lastIndex = buffer.end();
+    thread wordsThread(countWords, ref(buffer), numberOfCharacters, ref(lastIndex), ref(wordsLocal));
+    thread stringsThread(countCharacters, ref(buffer), numberOfCharacters, ref(lastIndex),
+                         ref(stringsLocal));
+
+    wordsThread.join();
+    // Merging words maps
+    wordsMutex.lock();
+
+    for (const pair<deque<wchar_t>, uint>& p : wordsLocal) {
+        words[p.first] += p.second;
+    }
+
+    wordsMutex.unlock();
+
+    stringsThread.join();
+    // Merging strings maps
+    stringsMutex.lock();
+
+    for (const pair<deque<wchar_t>, uint>& p : stringsLocal) {
+        strings[p.first] += p.second;
+    }
+
+    stringsMutex.unlock();
+
+    cout << "File: " << filename << " processed." << endl;
+}
+
+int main(int argc, char* argv[]) {
+    if (argc != 5) {
+        cout << "Usage: wiki2data inputFilePrefix numberOfFiles numberOfThreads numberOfCharacters" << endl;
+        return 1;
+    }
+
+    string inputFilePrefix = string(argv[1], strlen(argv[1]));
+    long numberOfFiles = stol(string(argv[2], strlen(argv[2])));
+    int numberOfThreads = stoi(string(argv[3], strlen(argv[3])));
+    long numberOfCharactersTmp = stol(string(argv[4], strlen(argv[4])));
+
+    if (numberOfFiles <= 0) {
+        cout << "Number of files should be greater than 0" << endl;
+        return 2;
+    }
+
+    if (numberOfThreads <= 0) {
+        cout << "Number of threads should be greater than 0" << endl;
+        return 3;
+    }
+
+    if (numberOfCharactersTmp <= 0) {
+        cout << "Number of characters should be greater than 0" << endl;
+        return 4;
+    }
+
+    size_t numberOfCharacters = static_cast<size_t>(numberOfCharactersTmp);
+
+    map<deque<wchar_t>, uint> words;
+    map<deque<wchar_t>, uint> strings;
+
+    mutex wordsMutex;
+    mutex stringsMutex;
+
+    deque<thread> activeThreads;
+
+    for (int f = 0; f < numberOfFiles; f++) {
+        char* suffix = new char[8];
+        sprintf(suffix, "_%02d", f);
+        string filename = inputFilePrefix + suffix;
+
+        activeThreads.push_back(thread(process, filename, numberOfCharacters, ref(words), ref(strings),
+                                       ref(wordsMutex),
+                                       ref(stringsMutex)));
+
+        // Wait until place in queue is available
+        if (activeThreads.size() == static_cast<size_t>(numberOfThreads)) {
+            activeThreads.front().join();
+            activeThreads.pop_front();
+        }
+    }
+
+    // Join all threads left;
+    for (thread& t : activeThreads) {
+        t.join();
+    }
+
+    activeThreads.clear();
+
+
     char* wordFilename = new char[8];
-    sprintf(wordFilename, "word_%02d", numberOfCharacters);
+    sprintf(wordFilename, "word_%02zu", numberOfCharacters);
 
     wofstream wordData;
-    wordData.imbue(std::locale("pl_PL.UTF-8"));
+    wordData.imbue(locale(""));
     wordData.open(wordFilename);
     save(wordData, words);
 
 
     char* stringsFilename = new char[8];
-    sprintf(stringsFilename, "char_%02d", numberOfCharacters);
+    sprintf(stringsFilename, "char_%02zu", numberOfCharacters);
 
     wofstream stringsData;
-    stringsData.imbue(std::locale("pl_PL.UTF-8"));
+    stringsData.imbue(locale(""));
     stringsData.open(stringsFilename);
     save(stringsData, strings);
 
